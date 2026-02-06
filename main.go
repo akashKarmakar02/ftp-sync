@@ -2,118 +2,128 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path"
-	"path/filepath"
 	"time"
 
 	"github.com/jlaffaye/ftp"
 )
 
 func main() {
-	// 1. Configuration from environment variables
-	ftpHost := os.Getenv("FTP_HOST")
-	if ftpHost == "" {
-		ftpHost = "localhost:21"
+	srcHost := os.Getenv("FTP_HOST")
+	if srcHost == "" {
+		srcHost = "localhost:21"
 	}
-	ftpUser := os.Getenv("FTP_USER")
-	ftpPass := os.Getenv("FTP_PASS")
+	srcUser := os.Getenv("FTP_USER")
+	srcPass := os.Getenv("FTP_PASS")
 
-	remoteDir := os.Getenv("REMOTE_DIR")
-	if remoteDir == "" {
-		remoteDir = "/"
+	destHost := os.Getenv("DEST_FTP_HOST")
+	if destHost == "" {
+		destHost = "localhost:21"
+	}
+	destUser := os.Getenv("DEST_FTP_USER")
+	destPass := os.Getenv("DEST_FTP_PASS")
+
+	srcDir := os.Getenv("REMOTE_DIR")
+	if srcDir == "" {
+		srcDir = ""
 	}
 
-	localDir := os.Getenv("LOCAL_DIR")
-	if localDir == "" {
-		localDir = "./sync_dir"
+	destDir := os.Getenv("DEST_DIR")
+	if destDir == "" {
+		destDir = ""
 	}
 
-	fmt.Printf("Connecting to %s as %s...\n", ftpHost, ftpUser)
-
-	// 2. Connect to FTP
-	c, err := ftp.Dial(ftpHost, ftp.DialWithTimeout(10*time.Second))
+	fmt.Printf("Connecting to Source %s as %s...\n", srcHost, srcUser)
+	srcConn, err := connectFTP(srcHost, srcUser, srcPass)
 	if err != nil {
-		log.Fatalf("Error connecting to FTP: %v", err)
+		log.Fatalf("Error connecting to source FTP: %v", err)
+	}
+	defer srcConn.Quit()
+
+	fmt.Printf("Connecting to Destination %s as %s...\n", destHost, destUser)
+	destConn, err := connectFTP(destHost, destUser, destPass)
+	if err != nil {
+		log.Fatalf("Error connecting to destination FTP: %v", err)
+	}
+	defer destConn.Quit()
+
+	fmt.Println("Connected to both servers. Starting sync...")
+
+	if err := srcConn.ChangeDir(srcDir); err != nil {
+		log.Fatalf("Source directory %s not accessible: %v", srcDir, err)
 	}
 
-	if err := c.Login(ftpUser, ftpPass); err != nil {
-		log.Fatalf("Error logging in: %v", err)
-	}
-	defer c.Quit()
-
-	fmt.Println("Connected. Starting sync...")
-
-	// 3. Create local root directory
-	if err := os.MkdirAll(localDir, 0755); err != nil {
-		log.Fatalf("Error creating local directory: %v", err)
-	}
-
-	// 4. Start recursive sync
-	if err := syncDir(c, remoteDir, localDir); err != nil {
+	if err := syncDir(srcConn, destConn, srcDir, destDir); err != nil {
 		log.Fatalf("Error syncing: %v", err)
 	}
 
 	fmt.Println("Sync completed successfully!")
 }
 
-// syncDir recursively synchronizes the remote directory to the local directory
-func syncDir(c *ftp.ServerConn, remotePath, localPath string) error {
-	entries, err := c.List(remotePath)
+func connectFTP(host, user, pass string) (*ftp.ServerConn, error) {
+	c, err := ftp.Dial(host, ftp.DialWithTimeout(10*time.Second))
 	if err != nil {
-		return fmt.Errorf("failed to list %s: %w", remotePath, err)
+		return nil, err
+	}
+
+	if err := c.Login(user, pass); err != nil {
+		c.Quit()
+		return nil, err
+	}
+	return c, nil
+}
+
+// syncDir recursively synchronizes the source FTP directory to the destination FTP directory
+func syncDir(src, dest *ftp.ServerConn, srcPath, destPath string) error {
+	entries, err := src.List(srcPath)
+	if err != nil {
+		return fmt.Errorf("failed to list %s on source: %w", srcPath, err)
+	}
+
+	if destPath != "." && destPath != "/" {
+		if err := dest.MakeDir(destPath); err != nil {
+			// Ignore error if dir likely exists.
+			// Unfortunately ftp lib doesn't return typed errors easily to distinguish EEXIST.
+			// Usually 550.
+		}
 	}
 
 	for _, entry := range entries {
-		// Skip . and ..
 		if entry.Name == "." || entry.Name == ".." {
 			continue
 		}
 
-		// Construct paths
-		// FTP paths use forward slash
-		currentRemotePath := path.Join(remotePath, entry.Name)
-		// Local paths use OS separator
-		currentLocalPath := filepath.Join(localPath, entry.Name)
+		fmt.Printf("Processing %s\n", entry.Name)
+
+		nextSrcPath := path.Join(srcPath, entry.Name)
+		nextDestPath := path.Join(destPath, entry.Name)
 
 		if entry.Type == ftp.EntryTypeFolder {
-			// Directory: Create local dir and recurse
-			if err := os.MkdirAll(currentLocalPath, 0755); err != nil {
-				return fmt.Errorf("failed to create dir %s: %w", currentLocalPath, err)
-			}
-			// fmt.Printf("Dir: %s -> %s\n", currentRemotePath, currentLocalPath)
-			if err := syncDir(c, currentRemotePath, currentLocalPath); err != nil {
+			if err := syncDir(src, dest, nextSrcPath, nextDestPath); err != nil {
 				return err
 			}
 		} else {
-			// File: Download
-			fmt.Printf("Downloading: %s\n", currentRemotePath)
-			if err := downloadFile(c, currentRemotePath, currentLocalPath); err != nil {
-				return fmt.Errorf("failed to download %s: %w", currentRemotePath, err)
+			fmt.Printf("Transferring: %s -> %s\n", nextSrcPath, nextDestPath)
+			if err := transferFile(src, dest, nextSrcPath, nextDestPath); err != nil {
+				return fmt.Errorf("failed to transfer %s: %w", nextSrcPath, err)
 			}
 		}
 	}
 	return nil
 }
 
-func downloadFile(c *ftp.ServerConn, remoteFile, localFile string) error {
-	resp, err := c.Retr(remoteFile)
+func transferFile(src, dest *ftp.ServerConn, srcFile, destFile string) error {
+	resp, err := src.Retr(srcFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("source RETR failed: %w", err)
 	}
 	defer resp.Close()
 
-	outFile, err := os.Create(localFile)
-	if err != nil {
-		return err
+	if err := dest.Stor(destFile, resp); err != nil {
+		return fmt.Errorf("destination STOR failed: %w", err)
 	}
-	// Ensure file is closed even if copy fails, usually handled by defer but
-	// in a loop/function it's safer to be explicit or use a closure if we were tight on resources.
-	// Since this is a separate function, defer is fine.
-	defer outFile.Close()
 
-	_, err = io.Copy(outFile, resp)
-	return err
+	return nil
 }
